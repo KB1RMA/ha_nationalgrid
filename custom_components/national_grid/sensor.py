@@ -9,6 +9,7 @@ from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
+    SensorStateClass,
 )
 
 from .const import _LOGGER, DOMAIN, UNIT_CCF, UNIT_KWH
@@ -80,6 +81,21 @@ def _get_energy_device_class(meter_data: MeterData) -> SensorDeviceClass | None:
     return SensorDeviceClass.ENERGY
 
 
+def _get_cumulative_usage(
+    coordinator: NationalGridDataUpdateCoordinator, meter_data: MeterData
+) -> float | None:
+    """Get the cumulative energy usage from imported long-term statistics."""
+    if coordinator.data is None:
+        return None
+    sp = str(meter_data.meter.get("servicePointNumber", ""))
+    return coordinator.data.cumulative_usage.get(sp)
+
+
+def _is_ami_meter(meter_data: MeterData) -> bool:
+    """Check if the meter has AMI smart meter capability."""
+    return bool(meter_data.meter.get("hasAmiSmartMeter", False))
+
+
 SENSOR_DESCRIPTIONS: tuple[NationalGridSensorEntityDescription, ...] = (
     NationalGridSensorEntityDescription(
         key="energy_cost",
@@ -94,6 +110,15 @@ SENSOR_DESCRIPTIONS: tuple[NationalGridSensorEntityDescription, ...] = (
         value_fn=_get_energy_usage,
         unit_fn=_get_energy_unit,
         device_class_fn=_get_energy_device_class,
+    ),
+    NationalGridSensorEntityDescription(
+        key="total_usage",
+        translation_key="total_usage",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        value_fn=_get_cumulative_usage,
+        unit_fn=_get_energy_unit,
+        device_class_fn=_get_energy_device_class,
+        available_fn=_is_ami_meter,
     ),
 )
 
@@ -143,6 +168,10 @@ class NationalGridSensor(NationalGridEntity, SensorEntity):
         self._attr_unique_id = (
             f"{DOMAIN}_{service_point_number}_{entity_description.key}"
         )
+        # Include the service point number in the name for the total_usage
+        # sensor so it's easy to identify in the Energy Dashboard picker.
+        if entity_description.key == "total_usage":
+            self._attr_name = f"{service_point_number} Total Usage"
         # Set dynamic unit based on meter type.
         if entity_description.unit_fn:
             self._attr_native_unit_of_measurement = entity_description.unit_fn(

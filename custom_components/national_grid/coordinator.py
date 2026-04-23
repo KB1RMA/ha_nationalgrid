@@ -55,6 +55,7 @@ class NationalGridCoordinatorData:
     accounts: dict[str, BillingAccount]
     ami_usages: dict[str, list[AmiEnergyUsage]] = field(default_factory=dict)
     costs: dict[str, list[EnergyUsageCost]] = field(default_factory=dict)
+    cumulative_usage: dict[str, float] = field(default_factory=dict)
     interval_reads: dict[str, list[IntervalRead]] = field(default_factory=dict)
     meters: dict[str, MeterData] = field(default_factory=dict)
     usages: dict[str, list[EnergyUsage]] = field(default_factory=dict)
@@ -262,6 +263,7 @@ class NationalGridDataUpdateCoordinator(
             accounts=dict(prev.accounts),
             ami_usages=dict(prev.ami_usages),
             costs=dict(prev.costs),
+            cumulative_usage=dict(prev.cumulative_usage),
             interval_reads=dict(prev.interval_reads),
             meters=dict(prev.meters),
             usages=dict(prev.usages),
@@ -759,8 +761,14 @@ class NationalGridDataUpdateCoordinator(
 
         # Import stats for just this meter (deferred import avoids circular import
         # at module level; statistics.py imports coordinator only under TYPE_CHECKING)
-        from .statistics import async_import_meter_statistics  # noqa: PLC0415
+        from .statistics import (  # noqa: PLC0415
+            async_import_meter_statistics,
+            async_import_sensor_statistics,
+        )
 
         await async_import_meter_statistics(
             self.hass, self, service_point, force_import_all=True
         )
+
+        # Mirror the refreshed external stats to the sensor entity
+        await async_import_sensor_statistics(self.hass, self)

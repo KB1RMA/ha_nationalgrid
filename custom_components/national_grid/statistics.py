@@ -31,10 +31,12 @@ from homeassistant.components.recorder.models import (
 )
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
+    async_import_statistics,
     get_last_statistics,
     statistics_during_period,
 )
 from homeassistant.const import UnitOfEnergy
+from homeassistant.helpers import entity_registry as er
 
 from .const import _LOGGER, DOMAIN
 
@@ -145,7 +147,7 @@ async def async_import_meter_statistics(
     is_gas = fuel_type == "Gas"
 
     if is_gas:
-        await _import_hourly_stats(
+        running_sum = await _import_hourly_stats(
             hass,
             service_point,
             ami_readings,
@@ -153,12 +155,14 @@ async def async_import_meter_statistics(
             force_import_all=force_import_all,
         )
     else:
-        await _import_hourly_stats_electric(
+        running_sum = await _import_hourly_stats_electric(
             hass,
             service_point,
             ami_readings,
             force_import_all=force_import_all,
         )
+
+    data.cumulative_usage[service_point] = running_sum
 
 
 async def async_import_all_statistics(
@@ -200,7 +204,7 @@ async def async_import_all_statistics(
         is_gas = fuel_type == "Gas"
 
         if is_gas:
-            await _import_hourly_stats(
+            running_sum = await _import_hourly_stats(
                 hass,
                 sp,
                 ami_readings,
@@ -209,7 +213,7 @@ async def async_import_all_statistics(
                 is_midnight_refresh=is_midnight_refresh,
             )
         else:
-            await _import_hourly_stats_electric(
+            running_sum = await _import_hourly_stats_electric(
                 hass,
                 sp,
                 ami_readings,
@@ -217,11 +221,155 @@ async def async_import_all_statistics(
                 is_midnight_refresh=is_midnight_refresh,
             )
 
+        data.cumulative_usage[sp] = running_sum
+
     # Import interval read stats (electric only; always cleared and reimported)
     for sp, reads in data.interval_reads.items():
         await _import_interval_stats_electric(hass, sp, reads)
 
     _LOGGER.info("Statistics import complete")
+
+
+async def async_import_sensor_statistics(
+    hass: HomeAssistant,
+    coordinator: NationalGridDataUpdateCoordinator,
+) -> None:
+    """Mirror external statistic history to total_usage sensor entities.
+
+    The Energy Dashboard needs recorder statistics under the sensor's entity_id
+    to display historical data. Instead of re-processing raw AMI readings
+    (which may only cover 7 days on incremental refreshes), this copies the
+    full history from the external statistic series — which already contains
+    ~45 days of backfilled data — into the sensor entity's statistics.
+
+    On each run it queries the sensor entity's last recorded sum, then fetches
+    all external statistic rows after that point and imports them under the
+    sensor's entity_id with source="recorder".
+    """
+    data = coordinator.data
+    if data is None:
+        return
+
+    registry = er.async_get(hass)
+
+    for sp in data.ami_usages:
+        meter_data = data.meters.get(sp)
+        if meter_data is None:
+            continue
+
+        if not meter_data.meter.get("hasAmiSmartMeter", False):
+            continue
+
+        unique_id = f"{DOMAIN}_{sp}_total_usage"
+        entity_id = registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+        if entity_id is None:
+            _LOGGER.debug(
+                "No entity registered for unique_id %s — skipping sensor stats",
+                unique_id,
+            )
+            continue
+
+        fuel_type = str(meter_data.meter.get("fuelType", ""))
+        is_gas = fuel_type == "Gas"
+
+        # Resolve the external statistic ID for consumption data
+        ext_stat_id, _, unit, unit_class, _ = _resolve_hourly_stat_info(
+            sp,
+            is_gas=is_gas,
+            return_only=False,
+        )
+
+        await _mirror_external_to_sensor(
+            hass,
+            ext_stat_id,
+            entity_id,
+            sp,
+            unit,
+            unit_class,
+        )
+
+
+async def _mirror_external_to_sensor(  # noqa: PLR0913
+    hass: HomeAssistant,
+    ext_stat_id: str,
+    entity_id: str,
+    service_point: str,
+    unit: str,
+    unit_class: str,
+) -> None:
+    """Copy external statistic rows that are missing from the sensor entity."""
+    # Find the sensor entity's last recorded statistic
+    sensor_last = await get_instance(hass).async_add_executor_job(
+        partial(
+            get_last_statistics,
+            hass,
+            1,
+            entity_id,
+            convert_units=True,
+            types={"sum"},
+        )
+    )
+    sensor_last_ts = 0.0
+    if sensor_last.get(entity_id):
+        sensor_last_ts = sensor_last[entity_id][0].get("start") or 0.0
+
+    # Fetch all external statistic rows after the sensor's last timestamp
+    start_dt = (
+        datetime.fromtimestamp(sensor_last_ts, tz=UTC)
+        if sensor_last_ts
+        else (datetime.fromtimestamp(0, tz=UTC))
+    )
+
+    ext_stats = await get_instance(hass).async_add_executor_job(
+        partial(
+            statistics_during_period,
+            hass,
+            start_dt,
+            None,  # end_time=None → through now
+            {ext_stat_id},
+            "hour",
+            None,
+            {"state", "sum"},
+        )
+    )
+
+    rows = ext_stats.get(ext_stat_id, [])
+    # Skip rows already imported (same timestamp as sensor's last)
+    new_rows = [r for r in rows if (r.get("start") or 0.0) > sensor_last_ts]
+
+    if not new_rows:
+        _LOGGER.debug(
+            "Sensor stats for %s already up to date (%s rows in external stat)",
+            entity_id,
+            len(rows),
+        )
+        return
+
+    stats = [
+        StatisticData(
+            start=datetime.fromtimestamp(r["start"], tz=UTC),
+            state=r.get("state") or 0.0,
+            sum=r.get("sum") or 0.0,
+        )
+        for r in new_rows
+    ]
+
+    metadata = _build_statistic_metadata(
+        entity_id,
+        f"{service_point} Total Usage",
+        unit,
+        unit_class,
+    )
+    metadata["source"] = "recorder"
+
+    async_import_statistics(hass, metadata, stats)
+
+    _LOGGER.info(
+        "Mirrored %s external stat rows to %s (sum=%.3f)",
+        len(stats),
+        entity_id,
+        stats[-1]["sum"],
+    )
 
 
 async def _import_hourly_stats_electric(
@@ -231,13 +379,15 @@ async def _import_hourly_stats_electric(
     *,
     force_import_all: bool = False,
     is_midnight_refresh: bool = False,
-) -> None:
+) -> float:
     """Import hourly AMI stats for electric, split by direction.
 
     Creates separate consumption (positive) and return (negative)
     statistics to match OPower / Energy Dashboard conventions.
+
+    Returns the consumption cumulative sum.
     """
-    await _import_hourly_stats(
+    consumption_sum = await _import_hourly_stats(
         hass,
         service_point,
         readings,
@@ -259,6 +409,8 @@ async def _import_hourly_stats_electric(
             is_midnight_refresh=is_midnight_refresh,
         )
 
+    return consumption_sum
+
 
 async def _import_hourly_stats(  # noqa: PLR0913
     hass: HomeAssistant,
@@ -270,8 +422,11 @@ async def _import_hourly_stats(  # noqa: PLR0913
     return_only: bool = False,
     force_import_all: bool = False,
     is_midnight_refresh: bool = False,
-) -> None:
-    """Import hourly AMI usage statistics."""
+) -> float:
+    """Import hourly AMI usage statistics.
+
+    Returns the final cumulative sum for the statistic series.
+    """
     stat_id, fuel, unit, unit_class, stat_name = _resolve_hourly_stat_info(
         service_point,
         is_gas=is_gas,
@@ -301,7 +456,7 @@ async def _import_hourly_stats(  # noqa: PLR0913
             fuel,
             service_point,
         )
-        return
+        return running_sum
 
     metadata = _build_statistic_metadata(
         stat_id,
@@ -317,6 +472,7 @@ async def _import_hourly_stats(  # noqa: PLR0913
         stat_id,
         running_sum,
     )
+    return running_sum
 
 
 async def _get_last_sum_and_ts(  # noqa: PLR0913
