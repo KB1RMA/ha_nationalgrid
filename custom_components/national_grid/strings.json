@@ -52,6 +52,9 @@
             },
             "energy_cost": {
                 "name": "Last Billing Cost"
+            },
+            "total_usage": {
+                "name": "Total Usage"
             }
         },
         "binary_sensor": {

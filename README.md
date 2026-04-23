@@ -14,6 +14,7 @@ This is a fork of [ryanmorash/ha_nationalgrid](https://github.com/ryanmorash/ha_
 - **Energy Usage Sensors**: Track monthly billing usage and costs for electric and gas meters
 - **Smart Meter Detection**: Identify meters with AMI (Advanced Metering Infrastructure) capabilities
 - **15-Minute AMI Statistics**: Import granular energy data (bucketed hourly) into Home Assistant's Energy Dashboard
+- **Total Usage Sensor**: Real entity with `state_class: total_increasing` for Energy Dashboard cost tracking and per-device cost breakdowns
 - **Solar/Return Support**: Separate statistics for grid consumption and energy returned to the grid
 - **Historical Data Import**: On first setup, imports up to ~45 days of available 15-min AMI data
 - **Fast Restarts**: After the initial import, HA restarts skip the historical fetch and load in seconds
@@ -69,10 +70,13 @@ The integration creates the following entities for each meter on your account:
 
 ### Sensors
 
-| Entity             | Description                       | Unit                       | Device Class |
-| ------------------ | --------------------------------- | -------------------------- | ------------ |
-| Last Billing Usage | Most recent monthly billing usage | kWh (electric) / CCF (gas) | Energy / Gas |
-| Last Billing Cost  | Most recent monthly billing cost  | $                          | Monetary     |
+| Entity             | Description                                        | Unit                       | Device Class | State Class      |
+| ------------------ | -------------------------------------------------- | -------------------------- | ------------ | ---------------- |
+| Last Billing Usage | Most recent monthly billing usage                  | kWh (electric) / CCF (gas) | Energy / Gas | —                |
+| Last Billing Cost  | Most recent monthly billing cost                   | $                          | Monetary     | —                |
+| Total Usage        | Cumulative energy usage from imported AMI statistics | kWh (electric) / CCF (gas) | Energy / Gas | Total Increasing |
+
+> **Note**: The **Total Usage** sensor is only created for meters with AMI smart meter capability. Its value is derived from the running sum computed during the AMI statistics import — no additional API calls are made.
 
 ### Binary Sensors
 
@@ -156,10 +160,13 @@ The integration maintains **two separate stat series** per electric meter:
 
 1. Go to **Settings > Dashboards > Energy**
 2. Under **Electricity grid**:
-   - Add `national_grid:{sp}_electric_hourly_usage` as **Grid consumption**
+   - Add `sensor.national_grid_{sp}_total_usage` as **Grid consumption**
+   - For cost tracking, select **Use an entity with current price** and provide your cost-per-kWh sensor (this enables per-device cost breakdowns in the Energy Dashboard)
    - If you have solar, add `national_grid:{sp}_electric_return_hourly_usage` as **Return to grid**
 3. Under **Gas consumption**:
    - Add `national_grid:{sp}_gas_hourly_usage`
+
+> **Why use the Total Usage sensor instead of the external statistic?** The external statistic (`national_grid:{sp}_electric_hourly_usage`) appears as "Entity without state" in the Energy Dashboard, which limits cost tracking to the "total costs" mode. The **Total Usage** sensor is a real entity with `state_class: total_increasing`, which unlocks all cost tracking options — including "Use an entity with current price" — and enables automatic per-device cost breakdowns.
 
 ## Services
 

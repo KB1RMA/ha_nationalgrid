@@ -13,6 +13,7 @@ from custom_components.national_grid.statistics import (
     _parse_ami_datetime,
     async_import_all_statistics,
     async_import_meter_statistics,
+    async_import_sensor_statistics,
 )
 
 
@@ -344,3 +345,273 @@ async def test_import_meter_statistics_unknown_sp(hass) -> None:
     ) as mock_add:
         await async_import_meter_statistics(hass, coordinator, "SP1")
         assert not mock_add.called
+
+
+# ---------------------------------------------------------------------------
+# cumulative_usage population tests
+# ---------------------------------------------------------------------------
+
+
+@patch("custom_components.national_grid.statistics.async_add_external_statistics")
+@patch("custom_components.national_grid.statistics.get_instance")
+async def test_import_all_populates_cumulative_usage_electric(
+    mock_get_instance,
+    mock_add_stats,  # noqa: ARG001
+    hass,
+) -> None:
+    """Test async_import_all_statistics populates cumulative_usage for electric."""
+    mock_get_instance.return_value.async_add_executor_job = AsyncMock(return_value={})
+
+    readings = [
+        {"date": "2025-01-15T10:00:00.000Z", "quantity": 5.0},
+        {"date": "2025-01-15T11:00:00.000Z", "quantity": 3.0},
+    ]
+    coordinator = MagicMock()
+    data = _make_coordinator_data(
+        ami_usages={"SP1": readings},
+        meters={"SP1": _make_meter_data("Electric")},
+    )
+    coordinator.data = data
+
+    await async_import_all_statistics(hass, coordinator)
+
+    assert data.cumulative_usage["SP1"] == 8.0
+
+
+@patch("custom_components.national_grid.statistics.async_add_external_statistics")
+@patch("custom_components.national_grid.statistics.get_instance")
+async def test_import_all_populates_cumulative_usage_gas(
+    mock_get_instance,
+    mock_add_stats,  # noqa: ARG001
+    hass,
+) -> None:
+    """Test async_import_all_statistics populates cumulative_usage for gas."""
+    mock_get_instance.return_value.async_add_executor_job = AsyncMock(return_value={})
+
+    readings = [
+        {"date": "2025-01-15T10:00:00.000Z", "quantity": 10.0},
+        {"date": "2025-01-15T11:00:00.000Z", "quantity": 6.0},
+    ]
+    coordinator = MagicMock()
+    data = _make_coordinator_data(
+        ami_usages={"SP1": readings},
+        meters={"SP1": _make_meter_data("Gas")},
+    )
+    coordinator.data = data
+
+    await async_import_all_statistics(hass, coordinator)
+
+    assert data.cumulative_usage["SP1"] == 16.0
+
+
+@patch("custom_components.national_grid.statistics.async_add_external_statistics")
+@patch("custom_components.national_grid.statistics.get_instance")
+async def test_import_all_cumulative_usage_consumption_only(
+    mock_get_instance,
+    mock_add_stats,  # noqa: ARG001
+    hass,
+) -> None:
+    """Test cumulative_usage only counts consumption (positive) for electric."""
+    mock_get_instance.return_value.async_add_executor_job = AsyncMock(return_value={})
+
+    readings = [
+        {"date": "2025-01-15T10:00:00.000Z", "quantity": 5.0},
+        {"date": "2025-01-15T10:15:00.000Z", "quantity": -2.0},  # solar return
+        {"date": "2025-01-15T11:00:00.000Z", "quantity": 3.0},
+    ]
+    coordinator = MagicMock()
+    data = _make_coordinator_data(
+        ami_usages={"SP1": readings},
+        meters={"SP1": _make_meter_data("Electric")},
+    )
+    coordinator.data = data
+
+    await async_import_all_statistics(hass, coordinator)
+
+    # Only positive readings count toward cumulative consumption
+    assert data.cumulative_usage["SP1"] == 8.0
+
+
+@patch("custom_components.national_grid.statistics.async_add_external_statistics")
+@patch("custom_components.national_grid.statistics.get_instance")
+async def test_import_meter_populates_cumulative_usage(
+    mock_get_instance,
+    mock_add_stats,  # noqa: ARG001
+    hass,
+) -> None:
+    """Test async_import_meter_statistics populates cumulative_usage."""
+    mock_get_instance.return_value.async_add_executor_job = AsyncMock(return_value={})
+
+    readings = [{"date": "2025-01-15T10:00:00.000Z", "quantity": 7.0}]
+    coordinator = MagicMock()
+    data = _make_coordinator_data(
+        ami_usages={"SP1": readings},
+        meters={"SP1": _make_meter_data("Electric")},
+    )
+    coordinator.data = data
+
+    await async_import_meter_statistics(hass, coordinator, "SP1", force_import_all=True)
+
+    assert data.cumulative_usage["SP1"] == 7.0
+
+
+# ---------------------------------------------------------------------------
+# async_import_sensor_statistics tests (mirrors external stats to sensor)
+# ---------------------------------------------------------------------------
+
+
+def _make_ami_meter_data(fuel_type: str = "Electric") -> MeterData:
+    """Create AMI-capable MeterData."""
+    return MeterData(
+        account_id="acct1",
+        meter={
+            "fuelType": fuel_type,
+            "servicePointNumber": "SP1",
+            "hasAmiSmartMeter": True,
+        },
+        billing_account={"billingAccountId": "acct1"},
+    )
+
+
+def _ext_stat_rows() -> dict:
+    """Return mock external statistic rows from statistics_during_period."""
+    return {
+        "national_grid:SP1_electric_hourly_usage": [
+            {"start": 1736935200.0, "state": 5.0, "sum": 5.0},  # 2025-01-15T10:00Z
+            {"start": 1736938800.0, "state": 3.0, "sum": 8.0},  # 2025-01-15T11:00Z
+        ]
+    }
+
+
+@patch("custom_components.national_grid.statistics.async_import_statistics")
+@patch("custom_components.national_grid.statistics.er.async_get")
+@patch("custom_components.national_grid.statistics.get_instance")
+async def test_sensor_stats_mirrors_external_history(
+    mock_get_instance,
+    mock_er_get,
+    mock_import_stats,
+    hass,
+) -> None:
+    """Test sensor stats are mirrored from external statistic history."""
+    # First call: get_last_statistics for sensor entity (empty)
+    # Second call: statistics_during_period for external stat (has rows)
+    mock_get_instance.return_value.async_add_executor_job = AsyncMock(
+        side_effect=[{}, _ext_stat_rows()]
+    )
+    mock_registry = MagicMock()
+    mock_registry.async_get_entity_id.return_value = (
+        "sensor.electric_meter_sp1_total_usage"
+    )
+    mock_er_get.return_value = mock_registry
+
+    coordinator = MagicMock()
+    coordinator.data = _make_coordinator_data(
+        ami_usages={"SP1": [{"date": "2025-01-15T10:00:00.000Z", "quantity": 5.0}]},
+        meters={"SP1": _make_ami_meter_data("Electric")},
+    )
+
+    await async_import_sensor_statistics(hass, coordinator)
+
+    assert mock_import_stats.called
+    metadata = mock_import_stats.call_args[0][1]
+    stats = mock_import_stats.call_args[0][2]
+    assert metadata["statistic_id"] == "sensor.electric_meter_sp1_total_usage"
+    assert metadata["source"] == "recorder"
+    assert len(stats) == 2
+    assert stats[1]["sum"] == 8.0
+
+
+@patch("custom_components.national_grid.statistics.async_import_statistics")
+@patch("custom_components.national_grid.statistics.er.async_get")
+@patch("custom_components.national_grid.statistics.get_instance")
+async def test_sensor_stats_skips_already_mirrored(
+    mock_get_instance,
+    mock_er_get,
+    mock_import_stats,
+    hass,
+) -> None:
+    """Test sensor stats are not re-imported when already up to date."""
+    # Sensor already has the last row
+    sensor_last = {
+        "sensor.electric_meter_sp1_total_usage": [
+            {"sum": 8.0, "start": 1736938800.0},  # same as external's last
+        ]
+    }
+    # External stats (all rows at or before sensor's last_ts)
+    mock_get_instance.return_value.async_add_executor_job = AsyncMock(
+        side_effect=[sensor_last, _ext_stat_rows()]
+    )
+    mock_registry = MagicMock()
+    mock_registry.async_get_entity_id.return_value = (
+        "sensor.electric_meter_sp1_total_usage"
+    )
+    mock_er_get.return_value = mock_registry
+
+    coordinator = MagicMock()
+    coordinator.data = _make_coordinator_data(
+        ami_usages={"SP1": [{"date": "2025-01-15T10:00:00.000Z", "quantity": 5.0}]},
+        meters={"SP1": _make_ami_meter_data("Electric")},
+    )
+
+    await async_import_sensor_statistics(hass, coordinator)
+
+    assert not mock_import_stats.called
+
+
+@patch("custom_components.national_grid.statistics.async_import_statistics")
+@patch("custom_components.national_grid.statistics.er.async_get")
+@patch("custom_components.national_grid.statistics.get_instance")
+async def test_sensor_stats_skips_unregistered_entity(
+    mock_get_instance,  # noqa: ARG001
+    mock_er_get,
+    mock_import_stats,
+    hass,
+) -> None:
+    """Test sensor stats are skipped when entity is not registered."""
+    mock_registry = MagicMock()
+    mock_registry.async_get_entity_id.return_value = None
+    mock_er_get.return_value = mock_registry
+
+    coordinator = MagicMock()
+    coordinator.data = _make_coordinator_data(
+        ami_usages={"SP1": [{"date": "2025-01-15T10:00:00.000Z", "quantity": 5.0}]},
+        meters={"SP1": _make_ami_meter_data("Electric")},
+    )
+
+    await async_import_sensor_statistics(hass, coordinator)
+
+    assert not mock_import_stats.called
+
+
+@patch("custom_components.national_grid.statistics.async_import_statistics")
+@patch("custom_components.national_grid.statistics.er.async_get")
+@patch("custom_components.national_grid.statistics.get_instance")
+async def test_sensor_stats_skips_non_ami_meter(
+    mock_get_instance,  # noqa: ARG001
+    mock_er_get,
+    mock_import_stats,
+    hass,
+) -> None:
+    """Test sensor stats are skipped for non-AMI meters."""
+    mock_registry = MagicMock()
+    mock_er_get.return_value = mock_registry
+
+    non_ami_meter = MeterData(
+        account_id="acct1",
+        meter={
+            "fuelType": "Gas",
+            "servicePointNumber": "SP1",
+            "hasAmiSmartMeter": False,
+        },
+        billing_account={"billingAccountId": "acct1"},
+    )
+    coordinator = MagicMock()
+    coordinator.data = _make_coordinator_data(
+        ami_usages={"SP1": [{"date": "2025-01-15T10:00:00.000Z", "quantity": 5.0}]},
+        meters={"SP1": non_ami_meter},
+    )
+
+    await async_import_sensor_statistics(hass, coordinator)
+
+    assert not mock_import_stats.called
+    mock_registry.async_get_entity_id.assert_not_called()

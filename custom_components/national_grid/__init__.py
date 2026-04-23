@@ -15,7 +15,7 @@ from homeassistant.helpers.event import async_track_time_change
 
 from .const import _LOGGER, DOMAIN
 from .coordinator import NationalGridDataUpdateCoordinator
-from .statistics import async_import_all_statistics
+from .statistics import async_import_all_statistics, async_import_sensor_statistics
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -63,9 +63,27 @@ async def async_setup_entry(
     await async_import_all_statistics(hass, coordinator)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Re-import statistics on each coordinator update.
+    # Backfill sensor entity statistics now that entities are registered.
+    await async_import_sensor_statistics(hass, coordinator)
+
+    # Re-import statistics on each coordinator update, then notify entities
+    # so the total_usage sensor picks up the new cumulative_usage values.
+    _importing = False
+
+    async def _import_and_notify() -> None:
+        nonlocal _importing
+        if _importing:
+            return
+        _importing = True
+        try:
+            await async_import_all_statistics(hass, coordinator)
+            await async_import_sensor_statistics(hass, coordinator)
+            coordinator.async_update_listeners()
+        finally:
+            _importing = False
+
     def _on_update() -> None:
-        hass.async_create_task(async_import_all_statistics(hass, coordinator))
+        hass.async_create_task(_import_and_notify())
 
     entry.async_on_unload(coordinator.async_add_listener(_on_update))
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))

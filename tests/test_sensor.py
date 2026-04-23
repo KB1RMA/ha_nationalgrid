@@ -7,13 +7,18 @@ from unittest.mock import MagicMock
 from homeassistant.components.sensor import SensorDeviceClass
 
 from custom_components.national_grid.const import UNIT_CCF, UNIT_KWH
-from custom_components.national_grid.coordinator import MeterData
+from custom_components.national_grid.coordinator import (
+    MeterData,
+    NationalGridCoordinatorData,
+)
 from custom_components.national_grid.sensor import (
     PARALLEL_UPDATES,
+    _get_cumulative_usage,
     _get_energy_cost,
     _get_energy_device_class,
     _get_energy_unit,
     _get_energy_usage,
+    _is_ami_meter,
 )
 
 
@@ -108,3 +113,70 @@ def test_electric_device_class() -> None:
     """Test electric meter returns ENERGY device class."""
     meter_data = _make_meter_data("Electric")
     assert _get_energy_device_class(meter_data) == SensorDeviceClass.ENERGY
+
+
+# ---------------------------------------------------------------------------
+# _get_cumulative_usage tests
+# ---------------------------------------------------------------------------
+
+
+def _make_coordinator_with_cumulative(
+    cumulative: dict[str, float],
+) -> MagicMock:
+    """Create a mock coordinator with cumulative_usage populated."""
+    coordinator = MagicMock()
+    coordinator.data = NationalGridCoordinatorData(
+        accounts={},
+        cumulative_usage=cumulative,
+    )
+    return coordinator
+
+
+def test_cumulative_usage_returns_value() -> None:
+    """Test cumulative usage returns the stored sum for a service point."""
+    meter_data = _make_meter_data("Electric")
+    coordinator = _make_coordinator_with_cumulative({"SP1": 671.91})
+    result = _get_cumulative_usage(coordinator, meter_data)
+    assert result == 671.91
+
+
+def test_cumulative_usage_returns_none_when_missing() -> None:
+    """Test cumulative usage returns None when service point has no data."""
+    meter_data = _make_meter_data("Electric")
+    coordinator = _make_coordinator_with_cumulative({})
+    result = _get_cumulative_usage(coordinator, meter_data)
+    assert result is None
+
+
+def test_cumulative_usage_returns_none_when_no_data() -> None:
+    """Test cumulative usage returns None when coordinator data is None."""
+    meter_data = _make_meter_data("Electric")
+    coordinator = MagicMock()
+    coordinator.data = None
+    result = _get_cumulative_usage(coordinator, meter_data)
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _is_ami_meter tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_ami_meter_true() -> None:
+    """Test AMI meter detection returns True for AMI meters."""
+    meter_data = _make_meter_data("Electric")
+    assert _is_ami_meter(meter_data) is True
+
+
+def test_is_ami_meter_false() -> None:
+    """Test AMI meter detection returns False for non-AMI meters."""
+    meter_data = MeterData(
+        account_id="acct1",
+        meter={
+            "fuelType": "Gas",
+            "servicePointNumber": "SP2",
+            "hasAmiSmartMeter": False,
+        },
+        billing_account={"billingAccountId": "acct1"},
+    )
+    assert _is_ami_meter(meter_data) is False
